@@ -160,7 +160,7 @@ let make_fanned_io_list size cstr =
   let r = ref [] in
   let l = Cstruct.len cstr in
   let rec iter off =
-    if off = 0 then ()
+    if off <= 0 then ()
     else
       let off = off - size in
       r := Cstruct.sub cstr off size :: !r;
@@ -255,7 +255,7 @@ type lru_entry = {
  * LRU to bump recently accessed nodes *)
   mutable children_alloc_ids : int64 KeyedMap.t;
   mutable highest_key : string;
-  raw_node : Cstruct.t;
+(*  raw_node : Cstruct.t; *)
   io_data : Cstruct.t list;
   logdata : logdata_index;
   childlinks : childlinks;
@@ -751,32 +751,6 @@ struct
     root.open_fs.filesystem.mount_options.has_tombstone
     && String.length value = 0
 
-  let _load_data_at filesystem logical =
-    Logs.debug (fun m -> m "_load_data_at %Ld" logical);
-    let cstr = _get_block_io () in
-    let io_data = make_fanned_io_list filesystem.sector_size cstr in
-    B.read filesystem.disk
-      Int64.(
-        div (mul logical @@ of_int P.block_size)
-        @@ of_int filesystem.other_sector_size)
-      io_data
-    >>= Lwt.wrap1 (function
-          | Result.Error _ ->
-              raise ReadError
-          | Result.Ok () ->
-              if not @@ Wodan_crc32c.cstruct_valid cstr then
-                raise @@ BadCRC logical
-              else (cstr, io_data) )
-
-  let _find_childlinks_offset cstr value_end =
-    let rec scan off poff =
-      if off < value_end then poff
-      else
-        let log1 = Cstruct.LE.get_uint64 cstr (off + P.key_size) in
-        if log1 <> 0L then scan (off - childlink_size) off else poff
-    in
-    scan (block_end - childlink_size) block_end
-
   (* build a logdata_index *)
   let _index_logdata cstr hdrsize =
     let value_count = Int32.to_int @@ get_anynode_hdr_value_count cstr in
@@ -803,6 +777,43 @@ struct
     r.old_value_end <- r.value_end;
     r
 
+  let _find_childlinks_offset cstr value_end =
+    let rec scan off poff =
+      if off < value_end then poff
+      else
+        let log1 = Cstruct.LE.get_uint64 cstr (off + P.key_size) in
+        if log1 <> 0L then scan (off - childlink_size) off else poff
+    in
+    scan (block_end - childlink_size) block_end
+
+  let _load_data_at filesystem logical =
+    Logs.debug (fun m -> m "_load_data_at %Ld" logical);
+    let cstr = _get_block_io () in
+    assert (Cstruct.len cstr = P.block_size);
+    let node_type, logdata =
+      match get_anynode_hdr_nodetype cstr with
+      | 1 ->
+          (`Root, _index_logdata cstr sizeof_rootnode_hdr)
+      | 2 ->
+          (`Child, _index_logdata cstr sizeof_childnode_hdr)
+      | ty -> raise (BadNodeType ty)
+    in
+    let rdepth = get_rootnode_hdr_depth cstr in
+    let childlinks_offset = _find_childlinks_offset cstr logdata.value_end in
+    let io_data = make_fanned_io_list filesystem.sector_size cstr in
+    B.read filesystem.disk
+      Int64.(
+        div (mul logical @@ of_int P.block_size)
+        @@ of_int filesystem.other_sector_size)
+      io_data
+    >>= Lwt.wrap1 (function
+          | Result.Error _ ->
+              raise ReadError
+          | Result.Ok () ->
+              if not @@ Wodan_crc32c.cstruct_valid cstr then
+                raise @@ BadCRC logical
+              else node_type, logdata, rdepth, childlinks_offset, io_data)
+
   let rec _gen_childlink_offsets start =
     if start >= block_end then []
     else start :: (_gen_childlink_offsets @@ (start + childlink_size))
@@ -821,22 +832,13 @@ struct
 
   let _load_root_node_at open_fs logical =
     Logs.debug (fun m -> m "_load_root_node_at");
-    let%lwt cstr, io_data = _load_data_at open_fs.filesystem logical in
+    let%lwt node_type, logdata, rdepth, childlinks_offset, io_data = _load_data_at open_fs.filesystem logical in
     let cache = open_fs.node_cache in
-    assert (Cstruct.len cstr = P.block_size);
-    let cached_node, logdata =
-      match get_anynode_hdr_nodetype cstr with
-      | 1 ->
-          (`Root, _index_logdata cstr sizeof_rootnode_hdr)
-      | ty ->
-          raise @@ BadNodeType ty
-    in
+    if node_type <> `Root then raise (BadNodeType 2);
     let alloc_id = next_alloc_id cache in
-    let rdepth = get_rootnode_hdr_depth cstr in
     let rec entry =
       { parent_key = None;
-        cached_node;
-        raw_node = cstr;
+        cached_node = node_type;
         rdepth;
         io_data;
         logdata;
@@ -845,8 +847,7 @@ struct
         children_alloc_ids = KeyedMap.create ();
         highest_key = top_key;
         prev_logical = Some logical;
-        childlinks =
-          {childlinks_offset = _find_childlinks_offset cstr logdata.value_end}
+        childlinks = {childlinks_offset}
       }
     in
     lru_xset cache.lru alloc_id entry;
@@ -854,21 +855,13 @@ struct
 
   let _load_child_node_at open_fs logical highest_key parent_key rdepth =
     Logs.debug (fun m -> m "_load_child_node_at");
-    let%lwt cstr, io_data = _load_data_at open_fs.filesystem logical in
+    let%lwt node_type, logdata, rdepth, childlinks_offset, io_data = _load_data_at open_fs.filesystem logical in
     let cache = open_fs.node_cache in
-    assert (Cstruct.len cstr = P.block_size);
-    let cached_node, logdata =
-      match get_anynode_hdr_nodetype cstr with
-      | 2 ->
-          (`Child, _index_logdata cstr sizeof_childnode_hdr)
-      | ty ->
-          raise @@ BadNodeType ty
-    in
+    if node_type <> `Root then raise (BadNodeType 1);
     let alloc_id = next_alloc_id cache in
     let rec entry =
       { parent_key = Some parent_key;
-        cached_node;
-        raw_node = cstr;
+        cached_node = node_type;
         rdepth;
         io_data;
         logdata;
@@ -877,8 +870,7 @@ struct
         children_alloc_ids = KeyedMap.create ();
         highest_key;
         prev_logical = Some logical;
-        childlinks =
-          {childlinks_offset = _find_childlinks_offset cstr logdata.value_end}
+        childlinks = {childlinks_offset}
       }
     in
     lru_xset cache.lru alloc_id entry;
@@ -901,6 +893,62 @@ struct
         in
         refsize >= size
 
+  let serialize_data data =
+    let len = List.fold_left (fun out cstr -> Cstruct.len cstr + out) 0 data in
+    try
+      Cstruct.set_len (List.hd data) len
+    with Failure _ -> assert false
+
+  let set_serialized_data serialized_data setter off v =
+    setter serialized_data off v
+
+  let set_data data setter off v =
+    set_serialized_data (serialize_data data) setter off v
+
+  let blit_data
+
+      Cstruct.blit zero_data 0 entry.raw_node hdrsize (block_end - hdrsize)
+
+  let set_hdr serialized_data gen val_count =
+    set_anynode_hdr_generation serialized_data gen;
+    set_anynode_hdr_value_count serialized_data val_count;
+    ()
+  
+  let set_logdata serialized_data logdata init_offset =
+    let offset =
+      KeyedMap.fold
+        (fun key va offset ->
+          let len = String.length va in
+          let len1 = len + P.key_size + sizeof_datalen in
+          Cstruct.blit_from_string key 0 serialized_data offset P.key_size;
+          Cstruct.LE.set_uint16 serialized_data (offset + P.key_size) len;
+          Cstruct.blit_from_string va 0 serialized_data (offset + P.key_size + sizeof_datalen) len;
+          offset + len1)
+        logdata.logdata_contents
+        init_offset
+    in
+    assert (offset = logdata.value_end)
+  
+  (*
+      Erase the end of the data which is not used.
+      Put 0 instead
+  *)
+  let set_padding serialized_data logdata =
+    if logdata.value_end < logdata.old_value_end then
+      let len = logdata.old_value_end - logdata.value_end in
+      Cstruct.blit (Cstruct.create len) 0 serialized_data logdata.value_end len
+  
+  (* Update the io_data of entry according to its current fields *)
+  let update_data entry gen =
+    let data = entry.io_data in
+    let serialized_data = serialize_data data in
+    let val_count = Int32.of_int (KeyedMap.length entry.logdata.logdata_contents) in
+    set_hdr serialized_data gen val_count;
+    set_logdata serialized_data entry.logdata (header_size entry.cached_node);
+    set_padding serialized_data entry.logdata;
+    (entry.logdata).old_value_end <- entry.logdata.value_end;
+    Wodan_crc32c.cstruct_reset serialized_data
+  
   let _write_node open_fs alloc_id =
     let cache = open_fs.node_cache in
     match lru_get cache.lru alloc_id with
@@ -908,10 +956,7 @@ struct
         failwith "missing lru entry in _write_node"
     | Some entry -> (
         let gen = next_generation open_fs.node_cache in
-        set_anynode_hdr_generation entry.raw_node gen;
-        set_anynode_hdr_value_count entry.raw_node
-        @@ Int32.of_int
-        @@ KeyedMap.length entry.logdata.logdata_contents;
+        update_data entry gen;
         let logical = next_logical_alloc_valid cache in
         Logs.debug (fun m ->
             m "_write_node logical:%Ld gen:%Ld vlen:%d value_end:%d" logical
@@ -921,7 +966,9 @@ struct
         ( match lookup_parent_link cache.lru entry with
         | Some (parent_key, parent_entry, offset) ->
             assert (parent_key <> alloc_id);
-            Cstruct.LE.set_uint64 parent_entry.raw_node
+            set_data
+              parent_entry.io_data
+              Cstruct.LE.set_uint64
               (Int64.to_int offset + P.key_size)
               logical
         | None ->
@@ -932,26 +979,6 @@ struct
               ()
           | Some scan_map ->
               bitv_set64 scan_map logical true );
-        let offset = ref @@ header_size entry.cached_node in
-        (* XXX Writes in sorted order *)
-        KeyedMap.iter
-          (fun key va ->
-            let len = String.length va in
-            let len1 = len + P.key_size + sizeof_datalen in
-            Cstruct.blit_from_string key 0 entry.raw_node !offset P.key_size;
-            Cstruct.LE.set_uint16 entry.raw_node (!offset + P.key_size) len;
-            Cstruct.blit_from_string va 0 entry.raw_node
-              (!offset + P.key_size + sizeof_datalen)
-              len;
-            offset := !offset + len1 )
-          entry.logdata.logdata_contents;
-        assert (!offset = entry.logdata.value_end);
-        ( if entry.logdata.value_end < entry.logdata.old_value_end then
-          let len = entry.logdata.old_value_end - entry.logdata.value_end in
-          Cstruct.blit (Cstruct.create len) 0 entry.raw_node
-            entry.logdata.value_end len );
-        (entry.logdata).old_value_end <- entry.logdata.value_end;
-        Wodan_crc32c.cstruct_reset entry.raw_node;
         ( match entry.prev_logical with
         | Some plog ->
             Logs.debug (fun m -> m "Decreasing dirty_count");
@@ -1150,7 +1177,6 @@ struct
     let entry =
       { parent_key;
         cached_node;
-        raw_node = cstr;
         rdepth;
         io_data;
         logdata;
