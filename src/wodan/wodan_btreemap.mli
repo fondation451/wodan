@@ -66,3 +66,5 @@ val find_last_opt : string -> 'a t -> (string * 'a) option
 val split_off_after : string -> 'a t -> 'a t
 
 val swap : 'a t -> 'a t -> unit
+
+val to_seq : 'a t -> (string * 'a) Seq.t

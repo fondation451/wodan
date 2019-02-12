@@ -112,3 +112,5 @@ let swap m1 m2 =
   let m = !m1 in
   m1 := !m2;
   m2 := m
+
+let to_seq m = FMap.to_seq !m

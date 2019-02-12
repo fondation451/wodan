@@ -665,6 +665,8 @@ struct
     let hash = Hashtbl.hash
   end
 
+  module N = Block.Make(B)(P)
+
   let key_of_cstruct key =
     if Cstruct.len key <> P.key_size then
       raise @@ BadKey (Cstruct.to_string key)
@@ -892,63 +894,7 @@ struct
           else block_end - entry.logdata.value_end
         in
         refsize >= size
-
-  let serialize_data data =
-    let len = List.fold_left (fun out cstr -> Cstruct.len cstr + out) 0 data in
-    try
-      Cstruct.set_len (List.hd data) len
-    with Failure _ -> assert false
-
-  let set_serialized_data serialized_data setter off v =
-    setter serialized_data off v
-
-  let set_data data setter off v =
-    set_serialized_data (serialize_data data) setter off v
-
-  let blit_data
-
-      Cstruct.blit zero_data 0 entry.raw_node hdrsize (block_end - hdrsize)
-
-  let set_hdr serialized_data gen val_count =
-    set_anynode_hdr_generation serialized_data gen;
-    set_anynode_hdr_value_count serialized_data val_count;
-    ()
-  
-  let set_logdata serialized_data logdata init_offset =
-    let offset =
-      KeyedMap.fold
-        (fun key va offset ->
-          let len = String.length va in
-          let len1 = len + P.key_size + sizeof_datalen in
-          Cstruct.blit_from_string key 0 serialized_data offset P.key_size;
-          Cstruct.LE.set_uint16 serialized_data (offset + P.key_size) len;
-          Cstruct.blit_from_string va 0 serialized_data (offset + P.key_size + sizeof_datalen) len;
-          offset + len1)
-        logdata.logdata_contents
-        init_offset
-    in
-    assert (offset = logdata.value_end)
-  
-  (*
-      Erase the end of the data which is not used.
-      Put 0 instead
-  *)
-  let set_padding serialized_data logdata =
-    if logdata.value_end < logdata.old_value_end then
-      let len = logdata.old_value_end - logdata.value_end in
-      Cstruct.blit (Cstruct.create len) 0 serialized_data logdata.value_end len
-  
-  (* Update the io_data of entry according to its current fields *)
-  let update_data entry gen =
-    let data = entry.io_data in
-    let serialized_data = serialize_data data in
-    let val_count = Int32.of_int (KeyedMap.length entry.logdata.logdata_contents) in
-    set_hdr serialized_data gen val_count;
-    set_logdata serialized_data entry.logdata (header_size entry.cached_node);
-    set_padding serialized_data entry.logdata;
-    (entry.logdata).old_value_end <- entry.logdata.value_end;
-    Wodan_crc32c.cstruct_reset serialized_data
-  
+      
   let _write_node open_fs alloc_id =
     let cache = open_fs.node_cache in
     match lru_get cache.lru alloc_id with
@@ -956,7 +902,15 @@ struct
         failwith "missing lru entry in _write_node"
     | Some entry -> (
         let gen = next_generation open_fs.node_cache in
-        update_data entry gen;
+        N.set_node
+          (N.import entry.io_data)
+          entry.cached_node
+          gen
+          (Int32.of_int (KeyedMap.length entry.logdata.logdata_contents))
+          (KeyedMap.to_seq entry.logdata.logdata_contents)
+          entry.logdata.value_end
+          entry.logdata.old_value_end;
+        (entry.logdata).old_value_end <- entry.logdata.value_end;
         let logical = next_logical_alloc_valid cache in
         Logs.debug (fun m ->
             m "_write_node logical:%Ld gen:%Ld vlen:%d value_end:%d" logical
